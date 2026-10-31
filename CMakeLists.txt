@@ -31,10 +31,12 @@ if(WIN32)
   set(SENTRY_TRANSPORT "winhttp" CACHE STRING "" FORCE)
 endif()
 if(REXCRASH_SENTRY_SOURCE)
+  set(_rexcrash_sentry_dir ${REXCRASH_SENTRY_SOURCE})
   add_subdirectory(${REXCRASH_SENTRY_SOURCE} ${CMAKE_BINARY_DIR}/rexcrash_sentry EXCLUDE_FROM_ALL)
 else()
   FetchContent_Declare(rexcrash_sentry GIT_REPOSITORY https://github.com/getsentry/sentry-native.git GIT_TAG 0.16.4 GIT_SHALLOW TRUE GIT_SUBMODULES "" EXCLUDE_FROM_ALL)
   FetchContent_MakeAvailable(rexcrash_sentry)
+  set(_rexcrash_sentry_dir ${rexcrash_sentry_SOURCE_DIR})
 endif()
 foreach(sentry_target sentry sentry-crash sentry-wer)
   if(TARGET ${sentry_target})
@@ -47,14 +49,15 @@ foreach(sentry_target sentry sentry-crash sentry-wer)
   endif()
 endforeach()
 
-# The window, on Windows: ImGui over Win32 and Direct3D 11, on the GPU or else on WARP, Windows' software
-# rasteriser, since it runs because something already went wrong, maybe in the graphics driver. A plain Win32
-# window covers Direct3D failing outright. Elsewhere there is no window yet, so crashes are only reported when the
-# player has turned on sending without asking.
+# The window. It runs because something already went wrong, maybe in the graphics driver, so it draws on a
+# renderer with a software fallback. On Windows: ImGui over Win32 and Direct3D 11, on the GPU or else on WARP,
+# Windows' software rasteriser, with a plain Win32 window if even that fails; built with the game. On Linux: ImGui
+# over SDL's renderer, which ends on its software renderer; a project of its own (reporter/CMakeLists.txt), as it
+# needs an SDL built with the renderer, which the SDK's isn't.
 if(WIN32)
   set(_rexcrash_imgui ${CMAKE_CURRENT_LIST_DIR}/thirdparty/imgui)
   add_executable(rexcrashreporter WIN32 EXCLUDE_FROM_ALL
-    ${CMAKE_CURRENT_LIST_DIR}/reporter/main.cpp ${CMAKE_CURRENT_LIST_DIR}/reporter/ui_imgui.cpp ${CMAKE_CURRENT_LIST_DIR}/reporter/ui_win32.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/reporter/main.cpp ${CMAKE_CURRENT_LIST_DIR}/reporter/ui_imgui.cpp ${CMAKE_CURRENT_LIST_DIR}/reporter/ui_imgui_d3d11.cpp ${CMAKE_CURRENT_LIST_DIR}/reporter/ui_win32.cpp
     ${_rexcrash_imgui}/imgui.cpp ${_rexcrash_imgui}/imgui_draw.cpp ${_rexcrash_imgui}/imgui_tables.cpp ${_rexcrash_imgui}/imgui_widgets.cpp
     ${_rexcrash_imgui}/backends/imgui_impl_win32.cpp ${_rexcrash_imgui}/backends/imgui_impl_dx11.cpp
   )
@@ -67,6 +70,17 @@ if(WIN32)
     string(TOUPPER "${config}" config_upper)
     set_property(TARGET rexcrashreporter PROPERTY ${config_upper}_POSTFIX "")
   endforeach()
+else()
+  include(ExternalProject)
+  set(_rexcrash_reporter_dir ${CMAKE_BINARY_DIR}/rexcrashreporter)
+  ExternalProject_Add(rexcrashreporter_project
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/reporter
+    BINARY_DIR ${_rexcrash_reporter_dir}
+    CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER} -DREXCRASH_SENTRY_SOURCE=${_rexcrash_sentry_dir}
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS ${_rexcrash_reporter_dir}/rexcrashreporter
+    EXCLUDE_FROM_ALL TRUE
+  )
 endif()
 
 function(rexcrash_attach target)
@@ -96,4 +110,8 @@ function(rexcrash_attach target)
       add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:${helper}> $<TARGET_FILE_DIR:${target}> VERBATIM)
     endif()
   endforeach()
+  if(TARGET rexcrashreporter_project)
+    add_dependencies(${target} rexcrashreporter_project)
+    add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_rexcrash_reporter_dir}/rexcrashreporter $<TARGET_FILE_DIR:${target}> VERBATIM)
+  endif()
 endfunction()

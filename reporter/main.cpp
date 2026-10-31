@@ -255,9 +255,14 @@ int Run(const std::vector<std::string>& args) {
   }
 
   if (!RunImGuiUi()) {
-    // Beside the crash data, so a player's report of the plain window says why.
+    // Beside the crash data, so whoever looks into it knows why there was no window, or only the plain one.
     std::ofstream(ToPath(g_session.database_path) / "crash-reporter.log", std::ios::app) << "ImGui window unavailable: " << g_session.window_error << "\n";
+#if defined(_WIN32)
     RunWin32Ui();
+#else
+    // No window at all, so no one to ask: the report is deleted unsent.
+    DiscardReport();
+#endif
   }
   return 0;
 }

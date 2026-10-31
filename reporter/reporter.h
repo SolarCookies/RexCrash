@@ -72,10 +72,11 @@ bool WriteMessageForGame(const std::string& message);
 // --- UIs --------------------------------------------------------------------
 
 /**
- * ImGui window over Win32 and Direct3D 11, on the GPU or else on WARP, Windows'
- * software rasteriser, as the driver may be what broke.
+ * The ImGui window, on a renderer with a software fallback, as the driver may
+ * be what broke: Direct3D 11 on the GPU or else on WARP (Windows), SDL's
+ * renderer on the GPU or else in software (Linux).
  *
- * Returns false, with the reason in g_session.window_error, if neither could
+ * Returns false, with the reason in g_session.window_error, if it could not
  * start.
  */
 bool RunImGuiUi();
