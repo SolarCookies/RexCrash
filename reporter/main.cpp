@@ -168,15 +168,47 @@ void DiscardReport() {
   }
 }
 
-// Appending wins: the config loader takes the last assignment of a key.
+// The config is TOML with one table per settings scope, where a repeated key fails to load. So the value goes in
+// [rexcrash], and any earlier one there or at the root (the old flat name) is dropped.
 void EnableReportingInConfig() {
   if (g_session.config_path.empty()) {
     return;
   }
-  std::ofstream config(ToPath(g_session.config_path), std::ios::app | std::ios::binary);
-  if (config) {
-    config << "\nsentry_enabled = true\n";
+  std::string text;
+  if (std::ifstream file(ToPath(g_session.config_path), std::ios::binary); file) {
+    text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
   }
+
+  std::istringstream in(text);
+  std::string out;
+  std::string table;
+  bool written = false;
+  for (std::string line; std::getline(in, line);) {
+    const std::string trimmed = Trim(line);
+    if (trimmed.size() > 1 && trimmed[0] == '[' && trimmed[1] != '[') {
+      const size_t close = trimmed.find(']');
+      table = Trim(trimmed.substr(1, close == std::string::npos ? std::string::npos : close - 1));
+      out += line + '\n';
+      if (table == "rexcrash" && !written) {
+        out += "sentry_enabled = true\n";
+        written = true;
+      }
+      continue;
+    }
+    if (const size_t equals = trimmed.find('='); equals != std::string::npos && trimmed[0] != '#') {
+      const std::string key = Trim(trimmed.substr(0, equals));
+      const bool in_rexcrash = table == "rexcrash" && key == "sentry_enabled";
+      const bool at_root = table.empty() && (key == "sentry_enabled" || key == "rexcrash.sentry_enabled");
+      if (in_rexcrash || at_root) {
+        continue;
+      }
+    }
+    out += line + '\n';
+  }
+  if (!written) {
+    out += "\n[rexcrash]\nsentry_enabled = true\n";
+  }
+  WriteTextFile(g_session.config_path, out);
 }
 
 void RestartGame() {

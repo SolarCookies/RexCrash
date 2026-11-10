@@ -12,23 +12,37 @@
 #include "frame_stats.h"
 
 #include <algorithm>
+#include <chrono>
 
-#include <rex/chrono/clock.h>
-#include <rex/logging.h>
-
-REXCVAR_DEFINE_INT32(fps_log_interval, 60, "Log",
-                     "Seconds between frame rate summary lines in the log (0 = off). One line "
-                     "per interval, not per frame.")
-    .range(0, 3600);
-
-REXCVAR_DEFINE_INT32(fps_hitch_ms, 250, "Log",
-                     "Log a warning when a single frame takes longer than this many "
-                     "milliseconds (0 = off). Rate limited to one line per second.")
-    .range(0, 60000);
+#include <rex/logging/log_category.h>
 
 namespace rexcrash {
 
 namespace {
+
+struct Settings final : rex::SettingOwner {
+  Settings() : rex::SettingOwner("rexcrash") {}
+  REX_SETTING(int32_t, fps_log_interval, 60,
+              "Seconds between frame rate summary lines in the log (0 = off). One line "
+              "per interval, not per frame.",
+              rex::Range{0, 3600});
+  REX_SETTING(int32_t, fps_hitch_ms, 250,
+              "Log a warning when a single frame takes longer than this many "
+              "milliseconds (0 = off). Rate limited to one line per second.",
+              rex::Range{0, 60000});
+};
+
+Settings& GetSettings() {
+  static Settings* settings = new Settings();
+  return *settings;
+}
+
+using HostClock = std::chrono::steady_clock;
+static_assert(HostClock::period::num == 1);
+
+uint64_t QueryHostTickFrequency() { return static_cast<uint64_t>(HostClock::period::den); }
+
+uint64_t QueryHostTickCount() { return static_cast<uint64_t>(HostClock::now().time_since_epoch().count()); }
 
 double TicksToMs(uint64_t ticks, uint64_t frequency) {
   return frequency ? static_cast<double>(ticks) * 1000.0 / static_cast<double>(frequency) : 0.0;
@@ -36,14 +50,16 @@ double TicksToMs(uint64_t ticks, uint64_t frequency) {
 
 }  // namespace
 
+rex::SettingOwner& FrameStatsSettings() { return GetSettings(); }
+
 FrameStats& FrameStats::Global() {
   static FrameStats instance;
   return instance;
 }
 
 void FrameStats::OnPresent() {
-  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
-  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t frequency = QueryHostTickFrequency();
+  const uint64_t now = QueryHostTickCount();
 
   total_frames_.fetch_add(1, std::memory_order_relaxed);
 
@@ -61,7 +77,7 @@ void FrameStats::OnPresent() {
   uptime_seconds_.store(TicksToMs(now - first_frame_tick_, frequency) / 1000.0,
                         std::memory_order_relaxed);
 
-  const int32_t hitch_ms = REXCVAR_GET(fps_hitch_ms);
+  const int32_t hitch_ms = GetSettings().fps_hitch_ms.Get();
   if (hitch_ms > 0 && TicksToMs(delta, frequency) >= static_cast<double>(hitch_ms)) {
     hitches_.fetch_add(1, std::memory_order_relaxed);
     // One line per second at most: a stall usually comes in bursts, and the
@@ -73,7 +89,7 @@ void FrameStats::OnPresent() {
     }
   }
 
-  const int32_t interval = REXCVAR_GET(fps_log_interval);
+  const int32_t interval = GetSettings().fps_log_interval.Get();
   if (interval > 0 && (now - interval_start_tick_) >= frequency * static_cast<uint64_t>(interval)) {
     PublishInterval(now, frequency, true);
   }
@@ -82,8 +98,7 @@ void FrameStats::OnPresent() {
 void FrameStats::FlushSummary() {
   if (!last_frame_tick_)
     return;
-  PublishInterval(rex::chrono::Clock::QueryHostTickCount(),
-                  rex::chrono::Clock::QueryHostTickFrequency(), false);
+  PublishInterval(QueryHostTickCount(), QueryHostTickFrequency(), false);
 }
 
 void FrameStats::PublishInterval(uint64_t now_ticks, uint64_t tick_frequency, bool log_it) {

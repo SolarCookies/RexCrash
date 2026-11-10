@@ -14,28 +14,30 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include <rex/cvar.h>
-#include <rex/filesystem.h>
-#include <rex/logging.h>
-#include <rex/logging/types.h>
-#include <rex/platform.h>
-#include <rex/platform/env.h>
-#include <rex/string.h>
+#include <rex/console_command.h>
+#include <rex/logging/log_category.h>
+#include <rex/logging/logger.h>
+#include <rex/platform/file.h>
+#include <rex/setting.h>
+#include <rex/settings_registry.h>
 #include <rex/version.h>
 
 #include "frame_stats.h"
 #include "log_buffer.h"
 #include "system_report.h"
 
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -52,27 +54,47 @@
 #define REXGLUE_BUILD_CONFIG "unknown"
 #endif
 
-REXCVAR_DEFINE_BOOL(sentry_enabled, false, "Telemetry", "Send reports automatically, without asking. Off by default. Crashes are unaffected: those always go through the crash reporter window, which sends nothing unless you press Send.");
-
-REXCVAR_DEFINE_STRING(sentry_dsn, "", "Telemetry", "Sentry ingest URL. Overrides the DSN the game was built with; normally left empty.");
-
-REXCVAR_DEFINE_STRING(sentry_environment, "", "Telemetry", "Environment reports are filed under (production, beta, ...). Empty uses the build configuration.");
-
-REXCVAR_DEFINE_STRING(sentry_user, "", "Telemetry", "Optional handle attached to reports so you can be contacted about them. Empty reports anonymously.");
-
-REXCVAR_DEFINE_BOOL(sentry_attach_log, true, "Telemetry", "Attach the in-memory log (see crash_log_kb) to reports.");
-
-REXCVAR_DEFINE_BOOL(sentry_scrub_paths, true, "Telemetry", "Replace your home directory with a placeholder in report text, so the account name in file paths is not uploaded.");
-
-REXCVAR_DEFINE_BOOL(sentry_debug, false, "Telemetry", "Log what the Sentry SDK is doing. For diagnosing reporting itself.");
-
-REXCVAR_DEFINE_INT32(crash_log_kb, 1024, "Telemetry", "How much of the most recent log reports carry, in KB, besides the startup lines").range(64, 65536);
-
-REXCVAR_DEFINE_BOOL(sentry_crash_dialog, true, "Telemetry", "On a crash, show the crash reporter window with the log, the crash details and a choice of sending the report, restarting or quitting. Windows only.");
-
 namespace rexcrash {
 
 namespace {
+
+rex::Result<void> RunBugReport(std::string_view args) {
+  // No description: open the reporter window so it can be typed there.
+  // With one: send straight away, which keeps the command scriptable.
+  if (args.empty()) {
+    OpenBugReport();
+  } else {
+    CaptureBugReport(args);
+  }
+  return rex::Ok();
+}
+
+struct Settings final : rex::SettingOwner {
+  Settings() : rex::SettingOwner("rexcrash") {}
+  REX_SETTING(bool, sentry_enabled, false, "Send reports automatically, without asking. Off by default. Crashes are unaffected: those always go through the crash reporter window, which sends nothing unless you press Send.");
+  REX_SETTING(std::string, sentry_dsn, "", "Sentry ingest URL. Overrides the DSN the game was built with; normally left empty.");
+  REX_SETTING(std::string, sentry_environment, "", "Environment reports are filed under (production, beta, ...). Empty uses the build configuration.");
+  REX_SETTING(std::string, sentry_user, "", "Optional handle attached to reports so you can be contacted about them. Empty reports anonymously.");
+  REX_SETTING(bool, sentry_attach_log, true, "Attach the in-memory log (see crash_log_kb) to reports.");
+  REX_SETTING(bool, sentry_scrub_paths, true, "Replace your home directory with a placeholder in report text, so the account name in file paths is not uploaded.");
+  REX_SETTING(bool, sentry_debug, false, "Log what the Sentry SDK is doing. For diagnosing reporting itself.");
+  REX_SETTING(int32_t, crash_log_kb, 1024, "How much of the most recent log reports carry, in KB, besides the startup lines", rex::Range{64, 65536});
+  REX_SETTING(bool, sentry_crash_dialog, true, "On a crash, show the crash reporter window with the log, the crash details and a choice of sending the report, restarting or quitting. Windows only.");
+  REX_COMMAND(bugreport, "Open the bug report window, or send one straight away when given a description",
+              RunBugReport);
+};
+
+Settings& GetSettings() {
+  static Settings* settings = new Settings();
+  return *settings;
+}
+
+// The flat cvar names of the old SDK, which old config files and command lines still use.
+constexpr std::string_view kOldNames[] = {
+    "sentry_enabled", "sentry_dsn",   "sentry_environment", "sentry_user",      "sentry_attach_log",
+    "sentry_scrub_paths", "sentry_debug", "crash_log_kb",   "sentry_crash_dialog", "fps_log_interval",
+    "fps_hitch_ms",
+};
 
 std::mutex g_mutex;
 bool g_started = false;
@@ -80,56 +102,97 @@ std::string g_app_name;
 std::filesystem::path g_crash_log_path;
 std::filesystem::path g_crash_summary_path;
 std::filesystem::path g_reporter_path;
-spdlog::sink_ptr g_breadcrumb_sink;
-std::shared_ptr<LogBuffer> g_log_buffer;
+// Never freed: the logger may still write to its sinks while the process exits.
+LogBuffer* g_log_buffer = nullptr;
+rex::ScopeGuard* g_log_buffer_guard = nullptr;
+rex::ScopeGuard* g_log_budget_watch = nullptr;
+rex::ScopeGuard* g_breadcrumb_guard = nullptr;
 std::function<std::vector<Mod>()> g_mods;
+thread_local bool t_in_breadcrumb = false;
 
+std::optional<std::string> GetEnv(const char* name) {
+#if defined(_WIN32)
+  const std::wstring wide_name(name, name + std::strlen(name));
+  const DWORD needed = GetEnvironmentVariableW(wide_name.c_str(), nullptr, 0);
+  if (needed == 0)
+    return std::nullopt;
+  std::wstring value(needed, L'\0');
+  const DWORD length = GetEnvironmentVariableW(wide_name.c_str(), value.data(), needed);
+  value.resize(length);
+  const int size = WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0,
+                                       nullptr, nullptr);
+  std::string out(size > 0 ? static_cast<size_t>(size) : 0, '\0');
+  if (size > 0)
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), out.data(), size, nullptr,
+                        nullptr);
+  return out;
+#else
+  const char* value = std::getenv(name);
+  return value ? std::optional<std::string>(value) : std::nullopt;
+#endif
+}
 
 std::string HomeDirectory() {
-#if REX_PLATFORM_WIN32
-  if (auto value = rex::platform::env::get("USERPROFILE"); value && !value->empty())
+#if defined(_WIN32)
+  if (auto value = GetEnv("USERPROFILE"); value && !value->empty())
     return *value;
 #endif
-  if (auto value = rex::platform::env::get("HOME"); value && !value->empty())
+  if (auto value = GetEnv("HOME"); value && !value->empty())
     return *value;
   return {};
 }
 
 // Feeds warnings and errors to Sentry as breadcrumbs, so a report arrives with
 // the trail that led to it even when the log attachment is turned off.
-class BreadcrumbSink final : public spdlog::sinks::base_sink<std::mutex> {
- protected:
-  void sink_it_(const spdlog::details::log_msg& msg) override {
-    std::string category(msg.logger_name.begin(), msg.logger_name.end());
-    std::string text(msg.payload.begin(), msg.payload.end());
-    if (REXCVAR_GET(sentry_scrub_paths))
+class BreadcrumbSink final : public rex::log::ILogSink {
+ public:
+  // Set around AddSink, which replays the kept lines: only lines from then on become breadcrumbs.
+  bool replaying = false;
+
+  void Write(const rex::log::Message& message) override {
+    if (replaying || message.level < rex::log::Level::kWarn)
+      return;
+    std::string category(message.category);
+    std::string text(message.text);
+    if (GetSettings().sentry_scrub_paths.Get())
       text = ScrubPaths(text);
 
+    t_in_breadcrumb = true;
     sentry_value_t crumb =
         sentry_value_new_breadcrumb("default", text.c_str());
     sentry_value_set_by_key(crumb, "category", sentry_value_new_string(category.c_str()));
     sentry_value_set_by_key(crumb, "level",
-                            sentry_value_new_string(msg.level >= spdlog::level::err ? "error"
-                                                                                   : "warning"));
+                            sentry_value_new_string(message.level >= rex::log::Level::kError ? "error"
+                                                                                            : "warning"));
     sentry_add_breadcrumb(crumb);
+    t_in_breadcrumb = false;
   }
 
-  void flush_() override {}
+  void Flush() override {}
 };
 
+BreadcrumbSink& GetBreadcrumbSink() {
+  static BreadcrumbSink* sink = new BreadcrumbSink();
+  return *sink;
+}
+
 void SentryLogger(sentry_level_t level, const char* message, va_list args, void*) {
+  // Sentry logging from inside the breadcrumb sink would re-enter the logger, which holds its sink lock.
+  if (t_in_breadcrumb)
+    return;
   char buffer[1024];
   std::vsnprintf(buffer, sizeof(buffer), message, args);
+  const char* text = buffer;
   if (level >= SENTRY_LEVEL_ERROR) {
-    REXLOG_ERROR("[sentry] {}", buffer);
+    REXLOG_ERROR("[sentry] {}", text);
   } else if (level == SENTRY_LEVEL_WARNING) {
-    REXLOG_WARN("[sentry] {}", buffer);
+    REXLOG_WARN("[sentry] {}", text);
   } else {
-    REXLOG_DEBUG("[sentry] {}", buffer);
+    REXLOG_DEBUG("[sentry] {}", text);
   }
 }
 
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
 // Resolves an address to "module+offset" without dbghelp. Symbol lookup wants
 // SymInitialize, which is far too much machinery to start up inside a crashed
 // process; Sentry symbolizes the minidump server-side anyway. This trace exists
@@ -216,7 +279,7 @@ void WriteCrashSummary(const sentry_ucontext_t* uctx) {
 
   std::fclose(file);
 }
-#endif  // REX_PLATFORM_WIN32
+#endif  // _WIN32
 
 // Runs in the crashing process, before the out-of-process daemon assembles the
 // envelope, so the file is on disk by the time the daemon reads the attachment
@@ -224,7 +287,7 @@ void WriteCrashSummary(const sentry_ucontext_t* uctx) {
 // TryWriteTo gives up rather than waiting if the dying thread happened to hold
 // the buffer lock.
 sentry_value_t OnCrash(const sentry_ucontext_t* uctx, sentry_value_t event, void*) {
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
   // Written before the daemon is signalled, so the reporter window it launches
   // finds both files already in place.
   WriteCrashSummary(uctx);
@@ -232,7 +295,7 @@ sentry_value_t OnCrash(const sentry_ucontext_t* uctx, sentry_value_t event, void
   (void)uctx;
 #endif
 
-  if (!REXCVAR_GET(sentry_attach_log) || g_crash_log_path.empty())
+  if (!GetSettings().sentry_attach_log.Get() || g_crash_log_path.empty())
     return event;
 
   auto buffer = g_log_buffer;
@@ -240,7 +303,7 @@ sentry_value_t OnCrash(const sentry_ucontext_t* uctx, sentry_value_t event, void
     return event;
 
   std::FILE* file = nullptr;
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
   _wfopen_s(&file, g_crash_log_path.c_str(), L"wb");
 #else
   file = std::fopen(g_crash_log_path.c_str(), "wb");
@@ -253,7 +316,7 @@ sentry_value_t OnCrash(const sentry_ucontext_t* uctx, sentry_value_t event, void
 }
 
 void SetExternalReporter(sentry_options_t* options, const std::filesystem::path& path) {
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
   sentry_options_set_external_crash_reporter_pathw(options, path.c_str());
 #else
   sentry_options_set_external_crash_reporter_path(options, path.c_str());
@@ -269,7 +332,7 @@ void WriteReporterInfo(const std::filesystem::path& database_path, const Config&
     return;
   }
   info << "app_name=" << g_app_name << "\n"
-       << "game_exe=" << rex::filesystem::GetExecutablePath().string() << "\n"
+       << "game_exe=" << rex::platform::GetExecutablePath().string() << "\n"
        << "database_path=" << database_path.string() << "\n"
        << "log_path=" << g_crash_log_path.string() << "\n"
        << "summary_path=" << g_crash_summary_path.string() << "\n"
@@ -333,7 +396,7 @@ void PublishStaticContexts() {
 
   sentry_value_t sdk = sentry_value_new_object();
   sentry_value_set_by_key(sdk, "version", sentry_value_new_string(REXGLUE_VERSION_STRING));
-  sentry_value_set_by_key(sdk, "build", sentry_value_new_string(REXGLUE_BUILD_STAMP));
+  sentry_value_set_by_key(sdk, "build", sentry_value_new_string(rex::GetBuildStamp()));
   sentry_value_set_by_key(sdk, "platform", sentry_value_new_string(REXGLUE_BUILD_PLATFORM));
   sentry_set_context("rexglue", sdk);
   sentry_set_tag("rexglue", REXGLUE_VERSION_STRING);
@@ -377,7 +440,7 @@ void PublishFrameStats(const FrameStats::Sample& sample) {
   sentry_value_set_by_key(context, "uptime_seconds",
                           sentry_value_new_double(sample.uptime_seconds));
   sentry_set_context("performance", context);
-  sentry_set_tag("fps", fmt::format("{:.0f}", sample.average_fps).c_str());
+  sentry_set_tag("fps", std::format("{:.0f}", sample.average_fps).c_str());
 }
 
 // Attaches the in-memory log for the duration of one capture. Attaching per
@@ -386,14 +449,14 @@ void PublishFrameStats(const FrameStats::Sample& sample) {
 class ScopedLogAttachment {
  public:
   ScopedLogAttachment() {
-    if (!REXCVAR_GET(sentry_attach_log))
+    if (!GetSettings().sentry_attach_log.Get())
       return;
     auto buffer = g_log_buffer;
     if (!buffer)
       return;
 
     text_ = buffer->Snapshot();
-    if (REXCVAR_GET(sentry_scrub_paths))
+    if (GetSettings().sentry_scrub_paths.Get())
       text_ = ScrubPaths(text_);
     if (text_.empty())
       return;
@@ -418,7 +481,7 @@ void Capture(sentry_level_t level, const char* logger, std::string_view message)
   ScopedLogAttachment attachment;
 
   std::string text(message);
-  if (REXCVAR_GET(sentry_scrub_paths))
+  if (GetSettings().sentry_scrub_paths.Get())
     text = ScrubPaths(text);
 
   sentry_capture_event(sentry_value_new_message_event(level, logger, text.c_str()));
@@ -451,19 +514,20 @@ std::string ScrubPaths(std::string_view text) {
   return out;
 }
 
-void ConfigureLogging(rex::LogConfig& config) {
-  if (!g_log_buffer) {
-    g_log_buffer = std::make_shared<LogBuffer>(static_cast<size_t>(REXCVAR_GET(crash_log_kb)) * 1024);
-    g_log_buffer->set_pattern(config.file_pattern);
-  }
-  config.extra_sinks.push_back(g_log_buffer);
-  // The player turned logging off: the loggers still run at info for the in-memory log, and nothing is written.
-  if (config.default_level == spdlog::level::off) {
-    config.default_level = spdlog::level::info;
-    config.log_file.clear();
-    config.log_dir.clear();
-    config.app_name.clear();
-  }
+rex::Result<void> Configure(rex::SettingsRegistry& settings) {
+  if (g_log_buffer)
+    return rex::Ok();
+  for (const std::string_view name : kOldNames)
+    settings.AddAlias(name, std::format("rexcrash.{}", name));
+  REX_TRY_VOID(settings.Register(GetSettings()));
+  REX_TRY_VOID(settings.Register(FrameStatsSettings()));
+
+  // Sized from the default here; the config file is read later, and the watch applies its crash_log_kb.
+  g_log_buffer = new LogBuffer(static_cast<size_t>(GetSettings().crash_log_kb.Get()) * 1024);
+  g_log_budget_watch = new rex::ScopeGuard(GetSettings().crash_log_kb.OnChange(
+      [](const int32_t& kb) { g_log_buffer->SetRingBudget(static_cast<size_t>(kb) * 1024); }));
+  g_log_buffer_guard = new rex::ScopeGuard(REX_LOGGER().AddSink(*g_log_buffer));
+  return rex::Ok();
 }
 
 void OnPresent() { FrameStats::Global().OnPresent(); }
@@ -478,8 +542,8 @@ bool Start(const Config& config) {
   // Starting up for the reporter alone is not a consent problem: with an
   // external reporter configured the daemon uploads nothing by itself, so a
   // crash report only leaves the machine when the player presses Send.
-  const bool automatic = REXCVAR_GET(sentry_enabled);
-  const bool crash_reporter = REXCVAR_GET(sentry_crash_dialog);
+  const bool automatic = GetSettings().sentry_enabled.Get();
+  const bool crash_reporter = GetSettings().sentry_crash_dialog.Get();
   if (!automatic && !crash_reporter) {
     REXLOG_INFO("Crash reporting is off (set sentry_enabled or sentry_crash_dialog)");
     return false;
@@ -489,10 +553,10 @@ bool Start(const Config& config) {
   // asking off, nothing starts.
   auto reporter_path = config.reporter_path;
   if (reporter_path.empty()) {
-#if REX_PLATFORM_WIN32
-    reporter_path = rex::filesystem::GetExecutableFolder() / "rexcrashreporter.exe";
+#if defined(_WIN32)
+    reporter_path = rex::platform::GetExecutableFolder() / "rexcrashreporter.exe";
 #else
-    reporter_path = rex::filesystem::GetExecutableFolder() / "rexcrashreporter";
+    reporter_path = rex::platform::GetExecutableFolder() / "rexcrashreporter";
 #endif
   }
   const bool ask = crash_reporter && std::filesystem::exists(reporter_path);
@@ -504,7 +568,7 @@ bool Start(const Config& config) {
     REXLOG_WARN("Crash reporter window not found at {}; crashes are sent without asking, as sentry_enabled is on", reporter_path.string());
   }
 
-  std::string dsn = REXCVAR_GET(sentry_dsn);
+  std::string dsn = GetSettings().sentry_dsn.Get();
   if (dsn.empty())
     dsn = config.dsn;
 #ifdef REXCRASH_SENTRY_DSN
@@ -528,14 +592,14 @@ bool Start(const Config& config) {
 
   auto database_path = config.database_path;
   if (database_path.empty())
-    database_path = rex::filesystem::GetExecutableFolder() / ".sentry-native";
+    database_path = rex::platform::GetExecutableFolder() / ".sentry-native";
 
   auto handler_path = config.handler_path;
   if (handler_path.empty()) {
-#if REX_PLATFORM_WIN32
-    handler_path = rex::filesystem::GetExecutableFolder() / "sentry-crash.exe";
+#if defined(_WIN32)
+    handler_path = rex::platform::GetExecutableFolder() / "sentry-crash.exe";
 #else
-    handler_path = rex::filesystem::GetExecutableFolder() / "sentry-crash";
+    handler_path = rex::platform::GetExecutableFolder() / "sentry-crash";
 #endif
   }
   if (!std::filesystem::exists(handler_path)) {
@@ -548,9 +612,9 @@ bool Start(const Config& config) {
     release = REXCRASH_SENTRY_RELEASE;
 #endif
   if (release.empty())
-    release = fmt::format("{}@{}", g_app_name, REXGLUE_VERSION_STRING);
+    release = std::format("{}@{}", g_app_name, REXGLUE_VERSION_STRING);
 
-  std::string environment = REXCVAR_GET(sentry_environment);
+  std::string environment = GetSettings().sentry_environment.Get();
   if (environment.empty())
     environment = config.environment;
   if (environment.empty())
@@ -569,7 +633,7 @@ bool Start(const Config& config) {
   sentry_options_set_dsn(options, dsn.c_str());
   sentry_options_set_release(options, release.c_str());
   sentry_options_set_environment(options, environment.c_str());
-  sentry_options_set_debug(options, REXCVAR_GET(sentry_debug) ? 1 : 0);
+  sentry_options_set_debug(options, GetSettings().sentry_debug.Get() ? 1 : 0);
   sentry_options_set_logger(options, SentryLogger, nullptr);
   sentry_options_set_on_crash(options, OnCrash, nullptr);
   sentry_options_set_max_breadcrumbs(options, 100);
@@ -589,7 +653,7 @@ bool Start(const Config& config) {
 
   // The wide overloads avoid a round trip through the ANSI code page, which
   // mangles paths under a non-ASCII account name.
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
   sentry_options_set_database_pathw(options, database_path.c_str());
   sentry_options_set_handler_pathw(options, handler_path.c_str());
   // Registered up front so the out-of-process handler knows to pick it up; the
@@ -607,7 +671,7 @@ bool Start(const Config& config) {
     return false;
   }
 
-  if (const std::string user = REXCVAR_GET(sentry_user); !user.empty()) {
+  if (const std::string user = GetSettings().sentry_user.Get(); !user.empty()) {
     sentry_value_t value = sentry_value_new_object();
     sentry_value_set_by_key(value, "username", sentry_value_new_string(user.c_str()));
     sentry_set_user(value);
@@ -619,9 +683,10 @@ bool Start(const Config& config) {
   FrameStats::Global().SetSummaryCallback(
       [](const FrameStats::Sample& sample) { PublishFrameStats(sample); });
 
-  g_breadcrumb_sink = std::make_shared<BreadcrumbSink>();
-  g_breadcrumb_sink->set_level(spdlog::level::warn);
-  rex::AddSink(g_breadcrumb_sink);
+  BreadcrumbSink& breadcrumbs = GetBreadcrumbSink();
+  breadcrumbs.replaying = true;
+  g_breadcrumb_guard = new rex::ScopeGuard(REX_LOGGER().AddSink(breadcrumbs));
+  breadcrumbs.replaying = false;
 
   g_started = true;
   REXLOG_INFO("Crash reporting ready: release {}, environment {}, automatic sending {}",
@@ -635,10 +700,8 @@ void Stop() {
     return;
 
   FrameStats::Global().SetSummaryCallback({});
-  if (g_breadcrumb_sink) {
-    rex::RemoveSink(g_breadcrumb_sink);
-    g_breadcrumb_sink.reset();
-  }
+  delete g_breadcrumb_guard;
+  g_breadcrumb_guard = nullptr;
 
   sentry_close();
   g_started = false;
@@ -684,7 +747,7 @@ bool WriteLogSnapshot() {
     return false;
   }
   const std::string text = buffer->Snapshot();
-  out << (REXCVAR_GET(sentry_scrub_paths) ? ScrubPaths(text) : text);
+  out << (GetSettings().sentry_scrub_paths.Get() ? ScrubPaths(text) : text);
   return true;
 }
 
@@ -695,7 +758,7 @@ bool WriteLogSnapshot() {
 
 void OpenBugReport() {
   if (!HasReporterWindow()) {
-    REXLOG_INFO("Usage: bugreport <what went wrong>");
+    REXLOG_INFO("Usage: rexcrash.bugreport <what went wrong>");
     return;
   }
 
@@ -708,7 +771,7 @@ void OpenBugReport() {
         std::filesystem::temp_directory_path(ec) / "rexglue-bugreport.txt";
     std::filesystem::remove(message_path, ec);
 
-    const std::string command = fmt::format("\"{}\" --bug-report \"{}\"",
+    const std::string command = std::format("\"{}\" --bug-report \"{}\"",
                                             g_reporter_path.string(), message_path.string());
     if (std::system(command.c_str()) != 0) {
       REXLOG_DEBUG("Bug report window exited without sending");
@@ -743,7 +806,7 @@ void OpenBugReport() {
 }
 
 void CaptureBugReport(std::string_view description) {
-  if (!IsStarted() || !REXCVAR_GET(sentry_enabled)) {
+  if (!IsStarted() || !GetSettings().sentry_enabled.Get()) {
     REXLOG_WARN("Cannot send a bug report: automatic reporting is off (set sentry_enabled)");
     return;
   }
@@ -756,13 +819,13 @@ void CaptureBugReport(std::string_view description) {
 }
 
 void CaptureError(std::string_view message) {
-  if (!IsStarted() || !REXCVAR_GET(sentry_enabled))
+  if (!IsStarted() || !GetSettings().sentry_enabled.Get())
     return;
   Capture(SENTRY_LEVEL_ERROR, "rexglue", message);
 }
 
 void CaptureFatal(std::string_view message) {
-  if (!IsStarted() || !REXCVAR_GET(sentry_enabled))
+  if (!IsStarted() || !GetSettings().sentry_enabled.Get())
     return;
   Capture(SENTRY_LEVEL_FATAL, "rexglue", message);
   // The process is about to go away, so wait for the upload rather than
@@ -771,17 +834,3 @@ void CaptureFatal(std::string_view message) {
 }
 
 }  // namespace rexcrash
-
-REXCVAR_DEFINE_COMMAND_ARGS(
-    bugreport,
-    [](std::string_view args) {
-      // No description: open the reporter window so it can be typed there.
-      // With one: send straight away, which keeps the command scriptable.
-      if (args.empty()) {
-        rexcrash::OpenBugReport();
-      } else {
-        rexcrash::CaptureBugReport(args);
-      }
-    },
-    "Telemetry",
-    "Open the bug report window, or send one straight away when given a description");
