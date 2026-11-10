@@ -59,7 +59,7 @@ bool SendReport(const std::string& message);
 /// reports are not left lying around.
 void DiscardReport();
 
-/// Appends `sentry_enabled = true` to the game's config.
+/// Sets `sentry_enabled = true` in the [rexcrash] table of the game's config.
 void EnableReportingInConfig();
 
 /// Relaunches the game.

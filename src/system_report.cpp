@@ -13,18 +13,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
+#include <format>
 #include <fstream>
 #include <string_view>
+#include <thread>
 #include <vector>
 
-#include <rex/logging.h>
-#include <rex/platform.h>
-#include <rex/string.h>
-#include <rex/string/utf8.h>
-#include <rex/thread.h>
+#include <rex/logging/log_category.h>
 
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -47,13 +46,17 @@ namespace rexcrash {
 
 namespace {
 
-#if REX_PLATFORM_WIN32
-// wchar_t and char16_t are distinct types even where both are 16 bits, so the
-// Win32 strings need a reinterpret before the shared UTF-8 conversion.
+#if defined(_WIN32)
 std::string WideToUtf8(const wchar_t* text) {
   if (!text)
     return {};
-  return rex::string::to_utf8(std::u16string_view(reinterpret_cast<const char16_t*>(text), std::wcslen(text)));
+  const int length = static_cast<int>(std::wcslen(text));
+  const int size = WideCharToMultiByte(CP_UTF8, 0, text, length, nullptr, 0, nullptr, nullptr);
+  if (size <= 0)
+    return {};
+  std::string out(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text, length, out.data(), size, nullptr, nullptr);
+  return out;
 }
 #endif
 
@@ -65,7 +68,7 @@ std::string Trim(std::string_view text) {
   return std::string(text.substr(begin, end - begin + 1));
 }
 
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
 
 // The x86 brand string, which is what users actually recognise. CPUID leaves
 // 0x80000002..4 hold it as three 16-byte chunks.
@@ -148,7 +151,7 @@ void QueryWindowsVersion(SystemReport& report) {
     using WineGetVersionFn = const char*(__cdecl*)();
     if (auto wine_get_version =
             reinterpret_cast<WineGetVersionFn>(GetProcAddress(ntdll, "wine_get_version"))) {
-      report.compatibility = fmt::format("Wine {}", wine_get_version());
+      report.compatibility = std::format("Wine {}", wine_get_version());
     }
   }
 
@@ -161,11 +164,11 @@ void QueryWindowsVersion(SystemReport& report) {
   if (!display.empty())
     report.os += " " + display;
   if (!build.empty()) {
-    report.os += revision ? fmt::format(" (build {}.{})", build, revision)
-                          : fmt::format(" (build {})", build);
+    report.os += revision ? std::format(" (build {}.{})", build, revision)
+                          : std::format(" (build {})", build);
   }
   if (version.dwMajorVersion) {
-    report.kernel = fmt::format("NT {}.{}.{}", version.dwMajorVersion, version.dwMinorVersion,
+    report.kernel = std::format("NT {}.{}.{}", version.dwMajorVersion, version.dwMinorVersion,
                                 version.dwBuildNumber);
   }
 }
@@ -211,7 +214,7 @@ void QueryGpus(SystemReport& report) {
 
         LARGE_INTEGER umd = {};
         if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
-          gpu.driver_version = fmt::format("{}.{}.{}.{}", HIWORD(umd.HighPart), LOWORD(umd.HighPart),
+          gpu.driver_version = std::format("{}.{}.{}.{}", HIWORD(umd.HighPart), LOWORD(umd.HighPart),
                                            HIWORD(umd.LowPart), LOWORD(umd.LowPart));
         }
         report.gpus.push_back(std::move(gpu));
@@ -224,7 +227,7 @@ void QueryGpus(SystemReport& report) {
   FreeLibrary(dxgi);
 }
 
-#else  // !REX_PLATFORM_WIN32
+#else  // !_WIN32
 
 std::string ReadFirstLine(const std::filesystem::path& path) {
   std::ifstream file(path);
@@ -260,7 +263,8 @@ void QueryLinuxVersion(SystemReport& report) {
 
   utsname uts = {};
   if (uname(&uts) == 0)
-    report.kernel = fmt::format("{} {}", uts.sysname, uts.release);
+    report.kernel = std::format("{} {}", static_cast<const char*>(uts.sysname),
+                                static_cast<const char*>(uts.release));
 }
 
 // DRM exposes the bound driver but not a marketing name, so report the driver
@@ -282,12 +286,12 @@ void QueryGpus(SystemReport& report) {
     GpuReport gpu;
     gpu.name = driver.empty() ? "unknown" : driver;
     if (!vendor.empty() && !product.empty())
-      gpu.name += fmt::format(" [{}:{}]", vendor, product);
+      gpu.name += std::format(" [{}:{}]", vendor, product);
     report.gpus.push_back(std::move(gpu));
   }
 }
 
-#endif  // REX_PLATFORM_WIN32
+#endif  // _WIN32
 
 }  // namespace
 
@@ -299,15 +303,15 @@ std::string FormatBytes(uint64_t bytes) {
     value /= 1024.0;
     ++unit;
   }
-  return unit == 0 ? fmt::format("{} {}", bytes, kUnits[unit])
-                   : fmt::format("{:.1f} {}", value, kUnits[unit]);
+  return unit == 0 ? std::format("{} {}", bytes, kUnits[unit])
+                   : std::format("{:.1f} {}", value, kUnits[unit]);
 }
 
 SystemReport QuerySystemReport() {
   SystemReport report;
-  report.cpu_threads = rex::thread::logical_processor_count();
+  report.cpu_threads = std::thread::hardware_concurrency();
 
-#if REX_PLATFORM_WIN32
+#if defined(_WIN32)
   QueryWindowsVersion(report);
   report.cpu = QueryCpuBrand();
   report.cpu_cores = QueryPhysicalCoreCount();
@@ -378,11 +382,11 @@ void LogSystemReport(const SystemReport& report) {
   }
   for (size_t i = 0; i < report.gpus.size(); ++i) {
     const auto& gpu = report.gpus[i];
-    std::string line = fmt::format("  GPU {}:   {}", i, gpu.name);
+    std::string line = std::format("  GPU {}:   {}", i, gpu.name);
     if (gpu.dedicated_vram)
-      line += fmt::format(", {} VRAM", FormatBytes(gpu.dedicated_vram));
+      line += std::format(", {} VRAM", FormatBytes(gpu.dedicated_vram));
     if (!gpu.driver_version.empty())
-      line += fmt::format(", driver {}", gpu.driver_version);
+      line += std::format(", driver {}", gpu.driver_version);
     REXLOG_INFO("{}", line);
   }
 
