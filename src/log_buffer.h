@@ -8,21 +8,29 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <format>
 #include <mutex>
 #include <string>
 
-#include <fmt/format.h>
-#include <spdlog/sinks/base_sink.h>
+#include <rex/logging/logger.h>
 
 namespace rexcrash {
 
-class LogBuffer final : public spdlog::sinks::base_sink<std::mutex> {
+class LogBuffer final : public rex::log::ILogSink {
  public:
   static constexpr size_t kHeaderBytes = 64 * 1024;
 
   explicit LogBuffer(size_t ring_bytes) : ring_budget_(ring_bytes) {}
+
+  // Applies a new ring budget, dropping the oldest lines that no longer fit.
+  void SetRingBudget(size_t ring_bytes) {
+    std::lock_guard lock(data_mutex_);
+    ring_budget_ = ring_bytes;
+    TrimLocked();
+  }
 
   // Moves everything so far into the header. Called once the startup lines are in.
   void PinPrefix() {
@@ -42,7 +50,7 @@ class LogBuffer final : public spdlog::sinks::base_sink<std::mutex> {
     std::string out;
     out.reserve(header_bytes_ + ring_bytes_ + 128);
     for (const auto& line : header_) out += line + '\n';
-    if (dropped_) out += fmt::format("... {} earlier line(s) dropped from the in-memory log ...\n", dropped_);
+    if (dropped_) out += std::format("... {} earlier line(s) dropped from the in-memory log ...\n", dropped_);
     for (const auto& line : ring_) out += line + '\n';
     return out;
   }
@@ -68,15 +76,32 @@ class LogBuffer final : public spdlog::sinks::base_sink<std::mutex> {
     return header_bytes_ + ring_bytes_;
   }
 
- protected:
-  void sink_it_(const spdlog::details::log_msg& msg) override {
-    spdlog::memory_buf_t formatted;
-    formatter_->format(msg, formatted);
-    std::string line(formatted.begin(), formatted.end());
+  void Write(const rex::log::Message& message) override {
+    std::string line = FormatFileLine(message);
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
     std::lock_guard lock(data_mutex_);
     ring_bytes_ += line.size() + 1;
     ring_.push_back(std::move(line));
+    TrimLocked();
+  }
+
+  void Flush() override {}
+
+ private:
+  // The layout of the SDK's log file: date and time, level letter, category, thread, text.
+  static std::string FormatFileLine(const rex::log::Message& message) {
+    rex::log::Message stamp = message;
+    stamp.text = {};
+    std::string line = rex::log::FormatLine(
+        stamp, {.timestamp = rex::log::TimestampStyle::kDateTime, .category = false, .thread = false, .color = false});
+    line += rex::log::LevelLetter(message.level);
+    line += ' ';
+    line += rex::log::FormatLine(
+        message, {.timestamp = rex::log::TimestampStyle::kNone, .category = true, .thread = true, .color = false});
+    return line;
+  }
+
+  void TrimLocked() {
     while (ring_bytes_ > ring_budget_ && !ring_.empty()) {
       ring_bytes_ -= ring_.front().size() + 1;
       ring_.pop_front();
@@ -84,9 +109,6 @@ class LogBuffer final : public spdlog::sinks::base_sink<std::mutex> {
     }
   }
 
-  void flush_() override {}
-
- private:
   std::deque<std::string> header_;
   std::deque<std::string> ring_;
   size_t header_bytes_ = 0;

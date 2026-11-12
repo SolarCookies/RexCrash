@@ -7,12 +7,12 @@
 //
 // The app wires it in at three points:
 //
-//   void OnConfigureLogging(rex::LogConfig& config) override { rexcrash::ConfigureLogging(config); }
-//   void OnPostSetup() override { ...; rexcrash::Start({.app_name = "retip", .database_path = ..., .mods = ...}); }
+//   rex::Result<void> OnConfigure(rex::SettingsRegistry& settings) override { REX_TRY_VOID(rexcrash::Configure(settings)); ... }
+//   rex::Result<void> OnInit() override { ...; rexcrash::Start({.app_name = "retip", .database_path = ..., .mods = ...}); }
 //   void OnShutdown() override { rexcrash::Stop(); }
 //
-// and calls rexcrash::OnPresent() once a frame for the frame rate. Start late in OnPostSetup, once the mods are
-// loaded: everything logged up to then becomes the part of the log every report keeps.
+// and calls rexcrash::OnPresent() once a frame for the frame rate. Start once the mods are loaded: everything
+// logged up to then becomes the part of the log every report keeps.
 
 #pragma once
 
@@ -22,8 +22,10 @@
 #include <string_view>
 #include <vector>
 
+#include <rex/result.h>
+
 namespace rex {
-struct LogConfig;
+class SettingsRegistry;
 }  // namespace rex
 
 namespace rexcrash {
@@ -54,9 +56,9 @@ struct Config {
   std::filesystem::path reporter_path;
 };
 
-// For ReXApp::OnConfigureLogging: adds the in-memory log, so reports carry it from the very first line. When
-// log_level is off, the loggers still run at info for it, and no log file is written.
-void ConfigureLogging(rex::LogConfig& config);
+// For App::OnConfigure: registers the settings (scope "rexcrash", old names as aliases) and adds the in-memory log.
+// The log gets the logger's kept startup lines, so reports carry it from the very first line.
+[[nodiscard]] rex::Result<void> Configure(rex::SettingsRegistry& settings);
 
 // Starts reporting. It starts when there is a DSN and either sentry_enabled (send without asking)
 // or sentry_crash_dialog (ask through the reporter window) is on; false otherwise.
@@ -74,9 +76,9 @@ void SetTag(std::string_view key, std::string_view value);
 void AddBreadcrumb(std::string_view category, std::string_view message);
 
 // Opens the reporter window for the player to describe a problem, then sends it from here. Also the console
-// command bugreport.
+// command rexcrash.bugreport.
 void OpenBugReport();
-// Sends a bug report with this description straight away: bugreport <description>.
+// Sends a bug report with this description straight away: rexcrash.bugreport <description>.
 void CaptureBugReport(std::string_view description);
 // A report of an error the game survived.
 void CaptureError(std::string_view message);

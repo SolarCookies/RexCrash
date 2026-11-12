@@ -16,12 +16,12 @@
 #include <functional>
 #include <mutex>
 
-#include <rex/cvar.h>
-
-REXCVAR_DECLARE(int32_t, fps_log_interval);
-REXCVAR_DECLARE(int32_t, fps_hitch_ms);
+#include <rex/setting.h>
 
 namespace rexcrash {
+
+// The owner of fps_log_interval and fps_hitch_ms (scope "rexcrash"), registered by Configure.
+rex::SettingOwner& FrameStatsSettings();
 
 /**
  * Frame pacing summary, published once per interval rather than per frame.
